@@ -1,0 +1,6 @@
+.git/
+.gitignore
+tests/
+docs/
+*.md
+.env
