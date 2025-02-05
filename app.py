@@ -40,34 +40,25 @@ class OptionsGreeksCalculator:
     def __init__(self, risk_free_rate: float = None):
         self.risk_free_rate = risk_free_rate or float(os.getenv('RISK_FREE_RATE', 0.07))
 
+    
     def calculate_greeks(self, spot: float, strike: float, expiry: str, iv: float, opt_type: str) -> Dict[str, float]:
-        try:
-            if spot <= 0 or strike <= 0 or iv <= 0:
-                return {}
-            t = self._time_to_expiry(expiry)
-            if t <= 0:
-                return self._expiry_greeks(spot, strike, opt_type)
-            sqrt_t = np.sqrt(t)
-            d1 = (np.log(spot / strike) + (self.risk_free_rate + 0.5 * iv ** 2) * t) / (iv * sqrt_t)
-            d2 = d1 - iv * sqrt_t
-            if opt_type.upper() == 'CE':
-                delta = norm.cdf(d1)
-                theta = (-(spot * norm.pdf(d1) * iv) / (2 * sqrt_t) -
-                         self.risk_free_rate * strike * np.exp(-self.risk_free_rate * t) * norm.cdf(d2))
-            else:
-                delta = -norm.cdf(-d1)
-                theta = (-(spot * norm.pdf(d1) * iv) / (2 * sqrt_t) +
-                         self.risk_free_rate * strike * np.exp(-self.risk_free_rate * t) * norm.cdf(-d2))
-            return {
-                'delta': delta,
-                'gamma': norm.pdf(d1) / (spot * iv * sqrt_t),
-                'theta': theta / 365,
-                'vega': spot * sqrt_t * norm.pdf(d1) / 100,
-                'iv_impact': iv / 20
-            }
-        except Exception as e:
-            logger.error(f"Greeks calculation error: {e}")
-            return {}
+        iv_decimal = iv / 100  # Convert VIX from percentage (e.g., 14.08 → 0.1408)
+        t = self._time_to_expiry(expiry)
+
+        if t <= 0:
+            return self._expiry_greeks(spot, strike, opt_type)
+
+        sqrt_t = np.sqrt(t)
+        d1 = (np.log(spot / strike) + (self.risk_free_rate + 0.5 * iv_decimal ** 2) * t) / (iv_decimal * sqrt_t)
+        d2 = d1 - iv_decimal * sqrt_t
+
+        return {
+            'delta': norm.cdf(d1) if opt_type.upper() == 'CE' else -norm.cdf(-d1),
+            'gamma': norm.pdf(d1) / (spot * iv_decimal * sqrt_t),
+            'theta': (-spot * norm.pdf(d1) * iv_decimal) / (2 * sqrt_t) / 365,
+            'vega': spot * sqrt_t * norm.pdf(d1) / 100,
+            'iv_impact': iv_decimal / 20
+        }
 
     def _time_to_expiry(self, expiry: str) -> float:
         try:
@@ -251,35 +242,72 @@ class IndexOptionsAnalyzer:
         }
 
     def _parse_trading_symbol(self, symbol: str) -> Dict[str, Any]:
-        pattern = r'^(?P<root>[A-Z]+)(?P<day>\d{2})(?P<mon>[A-Z]{3})(?P<year>\d{2,4})(?P<strike>\d+)(?P<opt_code>CE|PE)$'
+        """
+        Parses trading symbols to extract expiry, strike price, and option type.
+        Handles multiple expiry date formats like DDMMMYY, DDMMYY, DDMMYYYY, DDMMMYYYY.
+        """
+        pattern = r'^(?P<root>[A-Z]+)(?P<day>\d{2})(?P<mon>[A-Z]{3}|\d{2})(?P<year>\d{2,4})(?P<strike>\d+)(?P<opt_code>CE|PE)$'
+
         m = re.match(pattern, symbol)
         if not m:
             raise ValueError(f"Unable to parse trading symbol: {symbol}")
+
+        # Extract components
         day = m.group('day')
-        mon = m.group('mon')
-        year = m.group('year')
-        if len(year) == 2:
-            year = '20' + year
-        expiry = f"{day}{mon}{year}"
-        strike = float(m.group('strike'))
-        opt_type = 'CALL' if m.group('opt_code') == 'CE' else 'PUT'
+        month_part = m.group('mon')
+        year_part = m.group('year')
+        strike = float(m.group('strike'))  # Take strike price as is, NO division by 100
+        option_type = 'CALL' if m.group('opt_code') == 'CE' else 'PUT'
+
+        # Identify if month_part is numeric (DDMMYY, DDMMYYYY format) or textual (DDMMMYY, DDMMMYYYY)
+        if month_part.isdigit():
+            # Numeric month case: Assume DDMMYY or DDMMYYYY format
+            month = month_part[:2]  # Extract numeric month
+            if int(month) > 12:  # If month > 12, it's an invalid format
+                raise ValueError(f"Invalid month in symbol: {symbol}")
+        else:
+            # Textual month case: Assume DDMMMYY or DDMMMYYYY
+            month = month_part.upper()
+
+        # Convert year format
+        if len(year_part) == 2:
+            year = f"20{year_part}"  # Convert YY to YYYY (e.g., '25' → '2025')
+        else:
+            year = year_part  # Already in YYYY format
+
+        # Attempt to parse date into a standard format
+        try:
+            if month.isdigit():
+                # Numeric month case: Convert to standard datetime format
+                expiry_date = datetime.strptime(f"{day}{month}{year}", "%d%m%Y").strftime("%d-%b-%Y").upper()
+            else:
+                # Textual month case
+                expiry_date = datetime.strptime(f"{day}{month}{year}", "%d%b%Y").strftime("%d-%b-%Y").upper()
+        except ValueError:
+            raise ValueError(f"Invalid expiry date format in symbol: {symbol}")
+
         return {
             'strikePrice': strike,
-            'expiry': expiry,
-            'optionType': opt_type
+            'expiry': expiry_date,  # Standardized format (e.g., 06-FEB-2025)
+            'optionType': option_type
         }
+
 
     def _calculate_liquidity(self, option: Dict, futures: Dict) -> float:
         try:
-            option_oi = option.get('opnInterest', 0)
-            futures_oi = futures.get('opnInterest', 1)
+            option_oi = option.get('opnInterest', 0)  # Match JS keys
+            futures_oi = futures.get('openInterest', 1)
             option_vol = option.get('tradeVolume', 0)
             futures_vol = futures.get('tradeVolume', 1)
+
+            # Normalize to prevent division by zero
             oi_ratio = option_oi / futures_oi if futures_oi > 0 else 0
             vol_ratio = option_vol / futures_vol if futures_vol > 0 else 0
-            return min(0.4 * oi_ratio + 0.6 * vol_ratio, 1.0)
+
+            return min(0.4 * oi_ratio + 0.6 * vol_ratio, 1.0)  # Prevent overflow
         except Exception:
             return 0.5
+
 
     def _process_depth(self, depth: Dict) -> Dict:
         try:
