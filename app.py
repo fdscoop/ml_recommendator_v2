@@ -68,13 +68,18 @@ class OptionsGreeksCalculator:
     def _parse_exchange_expiry(self, expiry_str: str) -> datetime:
         try:
             clean_str = re.sub(r'[^a-zA-Z0-9]', '', expiry_str).upper()
+            
+            # Handle formats like 27FEB2025
+            if len(clean_str) == 9 and clean_str[2:5].isalpha():
+                return datetime.strptime(clean_str, '%d%b%Y')
+            
+            # Existing formats
             for fmt in ['%d%b%Y', '%Y%m%d']:
                 try:
-                    parsed = datetime.strptime(clean_str, fmt)
-                    return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+                    return datetime.strptime(clean_str, fmt)
                 except ValueError:
                     continue
-            raise ValueError(f"Unsupported expiry format: {expiry_str}")
+            raise ValueError(f"Unsupported expiry format: {clean_str}")
         except Exception as e:
             logger.error(f"Expiry parsing error for {expiry_str}: {e}")
             raise
@@ -111,6 +116,10 @@ class IndexOptionsAnalyzer:
             current_price = index_data.get('ltp', 0) or index_data.get('close', 0)
             vix = current_market.get('vix', {}).get('ltp', 0) / 100
             futures_data = current_market.get('futures', {})
+
+            logger.debug(f"Raw options_data: {json.dumps(options_data, indent=2)}")
+            reorganized_options = self.reorganize_options_data({'options': options_data}, current_price)
+            logger.debug(f"Reorganized options: {reorganized_options}")
 
             logger.info(f"Processing options with current price: {current_price}, VIX: {vix}")
 
@@ -175,9 +184,15 @@ class IndexOptionsAnalyzer:
         flattened = self._flatten_options(options_data)
         calls = flattened.get("calls", [])
         puts = flattened.get("puts", [])
-        calls_sorted = sorted(calls, key=lambda opt: abs(opt.get('strikePrice', float('inf')) - spot))
-        puts_sorted = sorted(puts, key=lambda opt: abs(opt.get('strikePrice', float('inf')) - spot))
-        return {"calls": calls_sorted[:3], "puts": puts_sorted[:3]}
+        
+        # Filter out invalid contracts missing critical fields
+        valid_calls = [c for c in calls if all(k in c for k in ('strikePrice', 'ltp', 'expiry'))]
+        valid_puts = [p for p in puts if all(k in p for k in ('strikePrice', 'ltp', 'expiry'))]
+        
+        calls_sorted = sorted(valid_calls, key=lambda opt: abs(opt['strikePrice'] - spot))[:3]
+        puts_sorted = sorted(valid_puts, key=lambda opt: abs(opt['strikePrice'] - spot))[:3]
+        
+        return {"calls": calls_sorted, "puts": puts_sorted}
 
     def _flatten_options(self, options_data: Dict) -> Dict[str, List[Dict]]:
         flattened = {"calls": [], "puts": []}
@@ -200,16 +215,13 @@ class IndexOptionsAnalyzer:
 
     def _process_contract(self, contract: Dict, spot: float, iv: float, futures: Dict) -> Dict:
         try:
-            expiry = contract.get('expiry')
-            if not expiry:
-                logger.warning(f"⚠️ Expiry missing in contract: {contract.get('tradingSymbol', 'Unknown')}")
-                expiry = self._parse_expiry_from_symbol(contract.get('tradingSymbol', ''))
+            # Convert strike price from 23500 to 235.00
+            strike = contract['strikePrice'] / 100  # Add this line
             
-            expiry_date = self.greeks_calculator._parse_exchange_expiry(str(expiry))
-            
+            # Use normalized strike
             greeks = self.greeks_calculator.calculate_greeks(
                 spot=spot,
-                strike=contract['strikePrice'],
+                strike=strike,  # Use normalized strike
                 expiry=expiry_date.strftime('%d%b%Y').upper(),
                 iv=iv,
                 opt_type='CE' if contract['optionType'].upper() == 'CALL' else 'PE'
@@ -233,6 +245,8 @@ class IndexOptionsAnalyzer:
         except Exception as e:
             logger.error(f"Contract processing error: {str(e)}")
             return {}
+
+
 
     def _parse_expiry_from_symbol(self, symbol: str) -> str:
         try:
