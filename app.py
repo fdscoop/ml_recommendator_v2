@@ -29,11 +29,14 @@ app = Flask(__name__)
 CORS(app)
 
 ###############################################################################
-# Options & Market Analysis Components
+# PART 1: Options & Market Analysis Components
 ###############################################################################
 
 class OptionsGreeksCalculator:
-    """Computes option Greeks given the underlying price, strike, expiry, IV, and option type."""
+    """
+    Computes option Greeks (delta, gamma, theta, vega, etc.) 
+    given the underlying price, strike, expiry, implied volatility, and option type.
+    """
     def __init__(self, risk_free_rate: float = None):
         self.risk_free_rate = risk_free_rate or float(os.getenv('RISK_FREE_RATE', 0.07))
 
@@ -41,19 +44,12 @@ class OptionsGreeksCalculator:
         try:
             if spot <= 0 or strike <= 0 or iv <= 0:
                 return {}
-            
-            expiry_date = parse_expiry_date(expiry)
-            if not expiry_date:
-                return {}
-
-            t = (expiry_date - datetime.now()).total_seconds() / (365 * 24 * 3600)
+            t = self._time_to_expiry(expiry)
             if t <= 0:
                 return self._expiry_greeks(spot, strike, opt_type)
-
             sqrt_t = np.sqrt(t)
             d1 = (np.log(spot / strike) + (self.risk_free_rate + 0.5 * iv ** 2) * t) / (iv * sqrt_t)
             d2 = d1 - iv * sqrt_t
-
             if opt_type.upper() == 'CE':
                 delta = norm.cdf(d1)
                 theta = (-(spot * norm.pdf(d1) * iv) / (2 * sqrt_t) -
@@ -62,7 +58,6 @@ class OptionsGreeksCalculator:
                 delta = -norm.cdf(-d1)
                 theta = (-(spot * norm.pdf(d1) * iv) / (2 * sqrt_t) +
                          self.risk_free_rate * strike * np.exp(-self.risk_free_rate * t) * norm.cdf(-d2))
-
             return {
                 'delta': delta,
                 'gamma': norm.pdf(d1) / (spot * iv * sqrt_t),
@@ -74,16 +69,6 @@ class OptionsGreeksCalculator:
             logger.error(f"Greeks calculation error: {e}")
             return {}
 
-    def _expiry_greeks(self, spot: float, strike: float, opt_type: str) -> Dict[str, float]:
-        intrinsic = max(spot - strike, 0) if opt_type.upper() == 'CE' else max(strike - spot, 0)
-        return {
-            'delta': 1.0 if intrinsic > 0 else 0.0,
-            'gamma': 0.0,
-            'theta': 0.0,
-            'vega': 0.0,
-            'iv_impact': 0.0
-        }
-
     def _time_to_expiry(self, expiry: str) -> float:
         try:
             expiry_date = self._parse_exchange_expiry(expiry)
@@ -94,44 +79,29 @@ class OptionsGreeksCalculator:
             logger.error(f"Time to expiry calculation error: {e}")
             return 0.0
 
-    ###############################################################################
-    # Expiry Date Parsing Logic (Handles Multiple Formats)
-    ###############################################################################
-
-    def parse_expiry_date(expiry_str: str) -> datetime:
-        """Parses expiry date from multiple possible formats and corrects incorrect years."""
+    def _parse_exchange_expiry(self, expiry_str: str) -> datetime:
         try:
-            expiry_str = re.sub(r'[^a-zA-Z0-9]', '', expiry_str).upper()  # Clean input
-
-            date_formats = [
-                "%d%b%Y",  # 06FEB2025
-                "%d%b%y",  # 06FEB25
-                "%Y%m%d",  # 20250206
-                "%y%m%d",  # 250206
-                "%b%y",    # FEB25
-                "%m/%d/%Y" # 02/06/2025
-            ]
-
-            for fmt in date_formats:
+            clean_str = re.sub(r'[^a-zA-Z0-9]', '', expiry_str).upper()
+            for fmt in ['%d%b%Y', '%Y%m%d']:
                 try:
-                    parsed_date = datetime.strptime(expiry_str, fmt)
-                    
-                    # Correct unrealistic years (e.g., 2523 → 2023)
-                    if parsed_date.year > 2100:
-                        parsed_date = parsed_date.replace(year=parsed_date.year - 500)
-
-                    return parsed_date  # Successfully parsed
+                    parsed = datetime.strptime(clean_str, fmt)
+                    return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
                 except ValueError:
                     continue
-
             raise ValueError(f"Unsupported expiry format: {expiry_str}")
-
         except Exception as e:
-            logger.error(f"Error parsing expiry date: {expiry_str} - {e}")
-            return None  # Return None if unable to parse
+            logger.error(f"Expiry parsing error for {expiry_str}: {e}")
+            raise
 
-
-
+    def _expiry_greeks(self, spot: float, strike: float, opt_type: str) -> Dict[str, float]:
+        intrinsic = max(spot - strike, 0) if opt_type.upper() == 'CE' else max(strike - spot, 0)
+        return {
+            'delta': 1.0 if intrinsic > 0 else 0.0,
+            'gamma': 0.0,
+            'theta': 0.0,
+            'vega': 0.0,
+            'iv_impact': 0.0
+        }
 
 class IndexOptionsAnalyzer:
     """
@@ -530,43 +500,34 @@ class TradingStrategyEngine:
         }
 
 ###############################################################################
-# Flask Endpoints
+# PART 4: Flask Endpoints
 ###############################################################################
 
-    
 @app.route('/webhook', methods=['POST'])
 def handle_webhook():
     try:
         payload = request.get_json()
         logger.info(f"Received webhook payload: {json.dumps(payload, indent=2)}")
-        
         if not payload or 'success' not in payload or 'analysis' not in payload:
             return jsonify({
                 "success": False,
                 "error": "Invalid payload format - missing required root keys"
             }), 400
-
         analysis_data = payload['analysis']
-        options = analysis_data.get("options_chain", {}).get("calls", []) + analysis_data.get("options_chain", {}).get("puts", [])
-
-        analyzer = OptionsGreeksCalculator()
-        greeks_results = []
-
-        for option in options:
-            spot = analysis_data.get("current_price", 0)
-            strike = option.get("strike")
-            expiry = option.get("expiry")
-            iv = option.get("greeks", {}).get("iv_impact", 0) * 20  # Reverse iv_impact calculation
-            opt_type = option.get("type")
-
-            if spot and strike and expiry and iv and opt_type:
-                greeks = analyzer.calculate_greeks(spot, strike, expiry, iv, opt_type)
-                option["calculated_greeks"] = greeks
-                greeks_results.append(option)
-
+        analyzer = IndexOptionsAnalyzer()
+        analysis_result = analyzer.analyze_options({'analysis': analysis_data})
+        if 'error' in analysis_result:
+            return jsonify({
+                "success": False,
+                "error": analysis_result['error']
+            }), 400
+        strategy_engine = TradingStrategyEngine()
+        strategies = strategy_engine.generate_strategies(analysis_result)
+        # historical_index_prices is used internally and not returned.
         return jsonify({
             "success": True,
-            "analysis": greeks_results
+            "analysis": analysis_result,
+            "strategies": strategies
         })
     except Exception as e:
         logger.error(f"Webhook processing error: {str(e)}", exc_info=True)
@@ -575,7 +536,6 @@ def handle_webhook():
             "error": "Internal server error",
             "details": str(e)
         }), 500
-
 
 @app.route("/")
 def home():
