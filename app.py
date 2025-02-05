@@ -533,6 +533,7 @@ class TradingStrategyEngine:
 # Flask Endpoints
 ###############################################################################
 
+    
 @app.route('/webhook', methods=['POST'])
 def handle_webhook():
     try:
@@ -546,12 +547,26 @@ def handle_webhook():
             }), 400
 
         analysis_data = payload['analysis']
+        options = analysis_data.get("options_chain", {}).get("calls", []) + analysis_data.get("options_chain", {}).get("puts", [])
+
         analyzer = OptionsGreeksCalculator()
-        analysis_result = analyzer.calculate_greeks(analysis_data)
-        
+        greeks_results = []
+
+        for option in options:
+            spot = analysis_data.get("current_price", 0)
+            strike = option.get("strike")
+            expiry = option.get("expiry")
+            iv = option.get("greeks", {}).get("iv_impact", 0) * 20  # Reverse iv_impact calculation
+            opt_type = option.get("type")
+
+            if spot and strike and expiry and iv and opt_type:
+                greeks = analyzer.calculate_greeks(spot, strike, expiry, iv, opt_type)
+                option["calculated_greeks"] = greeks
+                greeks_results.append(option)
+
         return jsonify({
             "success": True,
-            "analysis": analysis_result
+            "analysis": greeks_results
         })
     except Exception as e:
         logger.error(f"Webhook processing error: {str(e)}", exc_info=True)
@@ -560,6 +575,7 @@ def handle_webhook():
             "error": "Internal server error",
             "details": str(e)
         }), 500
+
 
 @app.route("/")
 def home():
