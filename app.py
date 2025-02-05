@@ -29,14 +29,11 @@ app = Flask(__name__)
 CORS(app)
 
 ###############################################################################
-# PART 1: Options & Market Analysis Components
+# Options & Market Analysis Components
 ###############################################################################
 
 class OptionsGreeksCalculator:
-    """
-    Computes option Greeks (delta, gamma, theta, vega, etc.) 
-    given the underlying price, strike, expiry, implied volatility, and option type.
-    """
+    """Computes option Greeks given the underlying price, strike, expiry, IV, and option type."""
     def __init__(self, risk_free_rate: float = None):
         self.risk_free_rate = risk_free_rate or float(os.getenv('RISK_FREE_RATE', 0.07))
 
@@ -44,12 +41,19 @@ class OptionsGreeksCalculator:
         try:
             if spot <= 0 or strike <= 0 or iv <= 0:
                 return {}
-            t = self._time_to_expiry(expiry)
+            
+            expiry_date = parse_expiry_date(expiry)
+            if not expiry_date:
+                return {}
+
+            t = (expiry_date - datetime.now()).total_seconds() / (365 * 24 * 3600)
             if t <= 0:
                 return self._expiry_greeks(spot, strike, opt_type)
+
             sqrt_t = np.sqrt(t)
             d1 = (np.log(spot / strike) + (self.risk_free_rate + 0.5 * iv ** 2) * t) / (iv * sqrt_t)
             d2 = d1 - iv * sqrt_t
+
             if opt_type.upper() == 'CE':
                 delta = norm.cdf(d1)
                 theta = (-(spot * norm.pdf(d1) * iv) / (2 * sqrt_t) -
@@ -58,6 +62,7 @@ class OptionsGreeksCalculator:
                 delta = -norm.cdf(-d1)
                 theta = (-(spot * norm.pdf(d1) * iv) / (2 * sqrt_t) +
                          self.risk_free_rate * strike * np.exp(-self.risk_free_rate * t) * norm.cdf(-d2))
+
             return {
                 'delta': delta,
                 'gamma': norm.pdf(d1) / (spot * iv * sqrt_t),
@@ -69,30 +74,6 @@ class OptionsGreeksCalculator:
             logger.error(f"Greeks calculation error: {e}")
             return {}
 
-    def _time_to_expiry(self, expiry: str) -> float:
-        try:
-            expiry_date = self._parse_exchange_expiry(expiry)
-            now = datetime.now().astimezone()
-            t = (expiry_date - now).total_seconds() / (365 * 24 * 3600)
-            return max(t, 0)
-        except Exception as e:
-            logger.error(f"Time to expiry calculation error: {e}")
-            return 0.0
-
-    def _parse_exchange_expiry(self, expiry_str: str) -> datetime:
-        try:
-            clean_str = re.sub(r'[^a-zA-Z0-9]', '', expiry_str).upper()
-            for fmt in ['%d%b%Y', '%Y%m%d']:
-                try:
-                    parsed = datetime.strptime(clean_str, fmt)
-                    return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
-                except ValueError:
-                    continue
-            raise ValueError(f"Unsupported expiry format: {expiry_str}")
-        except Exception as e:
-            logger.error(f"Expiry parsing error for {expiry_str}: {e}")
-            raise
-
     def _expiry_greeks(self, spot: float, strike: float, opt_type: str) -> Dict[str, float]:
         intrinsic = max(spot - strike, 0) if opt_type.upper() == 'CE' else max(strike - spot, 0)
         return {
@@ -103,11 +84,60 @@ class OptionsGreeksCalculator:
             'iv_impact': 0.0
         }
 
+    def _time_to_expiry(self, expiry: str) -> float:
+        try:
+            expiry_date = self._parse_exchange_expiry(expiry)
+            now = datetime.now().astimezone()
+            t = (expiry_date - now).total_seconds() / (365 * 24 * 3600)
+            return max(t, 0)
+        except Exception as e:
+            logger.error(f"Time to expiry calculation error: {e}")
+            return 0.0
+
+    ###############################################################################
+    # Expiry Date Parsing Logic (Handles Multiple Formats)
+    ###############################################################################
+
+    def parse_expiry_date(expiry_str: str) -> datetime:
+        """Parses expiry date from multiple possible formats and corrects incorrect years."""
+        try:
+            expiry_str = re.sub(r'[^a-zA-Z0-9]', '', expiry_str).upper()  # Clean input
+
+            date_formats = [
+                "%d%b%Y",  # 06FEB2025
+                "%d%b%y",  # 06FEB25
+                "%Y%m%d",  # 20250206
+                "%y%m%d",  # 250206
+                "%b%y",    # FEB25
+                "%m/%d/%Y" # 02/06/2025
+            ]
+
+            for fmt in date_formats:
+                try:
+                    parsed_date = datetime.strptime(expiry_str, fmt)
+                    
+                    # Correct unrealistic years (e.g., 2523 → 2023)
+                    if parsed_date.year > 2100:
+                        parsed_date = parsed_date.replace(year=parsed_date.year - 500)
+
+                    return parsed_date  # Successfully parsed
+                except ValueError:
+                    continue
+
+            raise ValueError(f"Unsupported expiry format: {expiry_str}")
+
+        except Exception as e:
+            logger.error(f"Error parsing expiry date: {expiry_str} - {e}")
+            return None  # Return None if unable to parse
+
+
+
+
 class IndexOptionsAnalyzer:
     """
     Extracts historical index, VIX, futures, and options data from the payload.
-    It reorganizes the options data into exactly three calls and three puts,
-    validating (and filling in) the expiry if missing.
+    Reorganizes the options data into exactly three calls and three puts.
+    Also computes technical indicators (pivot, support, and resistance) from today's data.
     """
     def __init__(self):
         self.greeks_calculator = OptionsGreeksCalculator()
@@ -145,6 +175,7 @@ class IndexOptionsAnalyzer:
                 for entry in historical_data.get("index", [])
                 if "price_data" in entry and "close" in entry["price_data"]
             ]
+            technical_indicators = self._compute_technical_indicators(historical_data)
             result = {
                 'current_price': current_price,
                 'vix': vix * 100,
@@ -152,12 +183,42 @@ class IndexOptionsAnalyzer:
                 'market_conditions': self._analyze_market_conditions(historical_data, vix),
                 'strategy_ratings': self._calculate_strategy_ratings(options_chain, vix),
                 # Keep historical data internally for forecasting (it will be removed from final output)
-                'historical_index_prices': historical_index_prices
+                'historical_index_prices': historical_index_prices,
+                'technical_indicators': technical_indicators
             }
             return result
         except Exception as e:
             logger.error(f"Analysis error: {str(e)}", exc_info=True)
             return {'error': str(e)}
+
+    def _compute_technical_indicators(self, historical_data: Dict) -> Dict:
+        """Compute pivot, R1, S1, R2, S2 based on today's intraday high, low, and close."""
+        index_history = historical_data.get("index", [])
+        if not index_history:
+            return {}
+        highs = [entry["price_data"]["high"] for entry in index_history if "price_data" in entry and "high" in entry["price_data"]]
+        lows = [entry["price_data"]["low"] for entry in index_history if "price_data" in entry and "low" in entry["price_data"]]
+        closes = [entry["price_data"]["close"] for entry in index_history if "price_data" in entry and "close" in entry["price_data"]]
+        if not highs or not lows or not closes:
+            return {}
+        today_high = max(highs)
+        today_low = min(lows)
+        today_close = closes[-1]
+        pivot = (today_high + today_low + today_close) / 3
+        R1 = 2 * pivot - today_low
+        S1 = 2 * pivot - today_high
+        R2 = pivot + (today_high - today_low)
+        S2 = pivot - (today_high - today_low)
+        return {
+            "today_high": today_high,
+            "today_low": today_low,
+            "today_close": today_close,
+            "pivot": pivot,
+            "R1": R1,
+            "S1": S1,
+            "R2": R2,
+            "S2": S2
+        }
 
     def reorganize_options_data(self, current_market: Dict, spot: float) -> Dict[str, List[Dict]]:
         options_data = current_market.get('options', {})
@@ -364,6 +425,47 @@ class ForecastingEngine:
 ###############################################################################
 
 class TradingStrategyEngine:
+    def generate_trade_signals(self, analysis: Dict) -> Dict:
+        """
+        Generate additional trade signals based on technical indicators.
+        Uses pivot points and support/resistance levels.
+        """
+        signals = {}
+        tech = analysis.get("technical_indicators", {})
+        current_price = analysis.get("current_price")
+        if tech and current_price:
+            pivot = tech.get("pivot")
+            R1 = tech.get("R1")
+            S1 = tech.get("S1")
+            # For a long entry: if current price is near support (within 1% above S1), signal a long entry.
+            if current_price <= S1 * 1.01:
+                signals["long_entry"] = "Current price is near support (S1). Consider entering a long position (buy call)."
+            elif current_price >= R1 * 0.99:
+                signals["long_entry"] = "Current price is near resistance (R1). Avoid entering a long position."
+            else:
+                signals["long_entry"] = "Market is in a neutral zone for long entries."
+
+            # For a long exit: if current price is approaching resistance (98% or higher of R1), signal an exit.
+            if current_price >= R1 * 0.98:
+                signals["long_exit"] = "Current price approaching resistance. Consider exiting long position."
+            else:
+                signals["long_exit"] = "Hold long position."
+
+            # For a short entry: if current price is near resistance, consider entering a short position (buy put).
+            if current_price >= R1 * 0.99:
+                signals["short_entry"] = "Current price is near resistance (R1). Consider entering a short position (buy put)."
+            elif current_price <= S1 * 1.01:
+                signals["short_entry"] = "Current price is near support (S1). Avoid entering a short position."
+            else:
+                signals["short_entry"] = "Market is in a neutral zone for short entries."
+
+            # For a short exit: if current price is nearing support (within 2% above S1), consider exiting a short.
+            if current_price <= S1 * 1.02:
+                signals["short_exit"] = "Current price approaching support. Consider exiting short position."
+            else:
+                signals["short_exit"] = "Hold short position."
+        return signals
+
     def generate_strategies(self, analysis: Dict) -> Dict:
         try:
             # Remove and downsample historical data to reduce output size.
@@ -375,13 +477,15 @@ class TradingStrategyEngine:
             if historical_prices and len(historical_prices) >= 10:
                 forecasting_engine = ForecastingEngine()
                 forecast_info = forecasting_engine.forecast_market(historical_prices)
+            trade_signals = self.generate_trade_signals(analysis)
             return {
                 'scalping': self._base_strategy(analysis, 'scalping', '10-15 minutes'),
                 'intraday': self._base_strategy(analysis, 'intraday', '1-4 hours'),
                 'swing': self._base_strategy(analysis, 'swing', '1-3 days'),
                 'risk_management': self._risk_parameters(analysis),
                 'market_conditions': analysis.get('market_conditions', {}),
-                'forecast': forecast_info
+                'forecast': forecast_info,
+                'trade_signals': trade_signals
             }
         except Exception as e:
             logger.error(f"Strategy generation error: {str(e)}")
@@ -426,7 +530,7 @@ class TradingStrategyEngine:
         }
 
 ###############################################################################
-# PART 4: Flask Endpoints
+# Flask Endpoints
 ###############################################################################
 
 @app.route('/webhook', methods=['POST'])
@@ -434,26 +538,20 @@ def handle_webhook():
     try:
         payload = request.get_json()
         logger.info(f"Received webhook payload: {json.dumps(payload, indent=2)}")
+        
         if not payload or 'success' not in payload or 'analysis' not in payload:
             return jsonify({
                 "success": False,
                 "error": "Invalid payload format - missing required root keys"
             }), 400
+
         analysis_data = payload['analysis']
-        analyzer = IndexOptionsAnalyzer()
-        analysis_result = analyzer.analyze_options({'analysis': analysis_data})
-        if 'error' in analysis_result:
-            return jsonify({
-                "success": False,
-                "error": analysis_result['error']
-            }), 400
-        strategy_engine = TradingStrategyEngine()
-        strategies = strategy_engine.generate_strategies(analysis_result)
-        # historical_index_prices is used internally and not returned.
+        analyzer = OptionsGreeksCalculator()
+        analysis_result = analyzer.calculate_greeks(analysis_data)
+        
         return jsonify({
             "success": True,
-            "analysis": analysis_result,
-            "strategies": strategies
+            "analysis": analysis_result
         })
     except Exception as e:
         logger.error(f"Webhook processing error: {str(e)}", exc_info=True)
