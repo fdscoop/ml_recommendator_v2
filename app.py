@@ -103,31 +103,42 @@ class IndexOptionsAnalyzer:
     def __init__(self):
         self.greeks_calculator = OptionsGreeksCalculator()
 
-    def analyze_options(self, payload: Dict) -> Dict:
+    def  analyze_options(self, payload: Dict) -> Dict:
         try:
             analysis_data = payload.get('analysis', {})
-            required_keys = ['current_market', 'historical_data']
+            required_keys = ['current_market', 'historical_data', 'options_structure']
             if not all(k in analysis_data for k in required_keys):
                 return {'error': f"Missing required keys: {required_keys}"}
+
             current_market = analysis_data['current_market']
             historical_data = analysis_data['historical_data']
+            options_structure = analysis_data.get('options_structure', {})
+
             market_required = ['index', 'vix', 'futures', 'options']
             if not all(k in current_market for k in market_required):
                 return {'error': f"Current market missing keys: {market_required}"}
+
             index_data = current_market.get('index', {})
             current_price = index_data.get('ltp', 0)
             if current_price == 0:
                 current_price = index_data.get('close', 0)
+
             vix = current_market.get('vix', {}).get('ltp', 0) / 100
             futures_data = current_market.get('futures', {})
 
             logger.info(f"Processing options with current price: {current_price}, VIX: {vix}")
 
-            reorganized_options = self.reorganize_options_data(current_market, current_price)
+            # ✅ Get options from `options_structure` if available, otherwise fallback to `current_market`
+            options_data = options_structure.get('options', current_market.get('options', {}))
+            
+            # Reorganize options data
+            reorganized_options = self.reorganize_options_data(options_data, current_price)
+            
+            # Process calls and puts
             processed_calls = [self._process_contract(opt, current_price, vix, futures_data) 
-                               for opt in reorganized_options.get("calls", [])]
+                            for opt in reorganized_options.get("calls", [])]
             processed_puts = [self._process_contract(opt, current_price, vix, futures_data) 
-                              for opt in reorganized_options.get("puts", [])]
+                            for opt in reorganized_options.get("puts", [])]
             options_chain = {"calls": processed_calls, "puts": processed_puts}
 
             # Extract historical index prices from the payload.
@@ -136,6 +147,7 @@ class IndexOptionsAnalyzer:
                 for entry in historical_data.get("index", [])
                 if "price_data" in entry and "close" in entry["price_data"]
             ]
+
             technical_indicators = self._compute_technical_indicators(historical_data)
             result = {
                 'current_price': current_price,
@@ -148,9 +160,11 @@ class IndexOptionsAnalyzer:
                 'technical_indicators': technical_indicators
             }
             return result
+
         except Exception as e:
             logger.error(f"Analysis error: {str(e)}", exc_info=True)
             return {'error': str(e)}
+
 
     def _compute_technical_indicators(self, historical_data: Dict) -> Dict:
         """Compute pivot, R1, S1, R2, S2 based on today's intraday high, low, and close."""
@@ -211,13 +225,18 @@ class IndexOptionsAnalyzer:
 
     def _process_contract(self, contract: Dict, spot: float, iv: float, futures: Dict) -> Dict:
         required_fields = ['ltp', 'strikePrice', 'expiry', 'optionType']
+        
+        # ✅ Check if expiry is missing, fetch from trading symbol
         if any(f not in contract for f in required_fields):
             trading_symbol = contract.get('tradingSymbol', '')
             if not trading_symbol:
                 raise ValueError("Missing tradingSymbol to parse contract details")
             parsed_data = self._parse_trading_symbol(trading_symbol)
             contract = {**contract, **parsed_data}
+
+        # ✅ Check expiry from options_structure first
         expiry_date = self.greeks_calculator._parse_exchange_expiry(str(contract['expiry']))
+
         greeks = self.greeks_calculator.calculate_greeks(
             spot=spot,
             strike=contract['strikePrice'],
@@ -225,6 +244,7 @@ class IndexOptionsAnalyzer:
             iv=iv,
             opt_type='CE' if contract['optionType'].upper() == 'CALL' else 'PE'
         )
+
         return {
             'symbol': contract.get('tradingSymbol', ''),
             'strike': contract['strikePrice'],
