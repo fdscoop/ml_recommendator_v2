@@ -221,7 +221,7 @@ class IndexOptionsAnalyzer:
             # Normalize strike price: convert 23500 to 235.00
             strike = contract['strikePrice'] / 100
 
-            # Determine expiry: if expiry is not available or unparseable, extract from trading symbol.
+            # Always use the expiry from the options_structure if available.
             expiry_date = None
             if contract.get('expiry'):
                 try:
@@ -229,15 +229,16 @@ class IndexOptionsAnalyzer:
                 except Exception:
                     expiry_date = None
 
+            # If expiry_date is not available, as a fallback try to parse from tradingSymbol.
             if not expiry_date:
                 expiry_str = self._parse_expiry_from_symbol(contract.get('tradingSymbol', ''))
                 try:
                     expiry_date = datetime.strptime(expiry_str, '%d%b%Y')
                 except Exception as e:
                     logger.error(f"Failed to parse expiry from symbol {contract.get('tradingSymbol', '')}: {e}")
-                    expiry_date = datetime.now()
+                    expiry_date = datetime.now()  # or handle appropriately
 
-            # Calculate greeks
+            # Calculate greeks with the expiry from options_structure.
             greeks = self.greeks_calculator.calculate_greeks(
                 spot=spot,
                 strike=strike,
