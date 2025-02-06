@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import numpy as np
 from scipy.stats import norm
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 import re
 import os
@@ -81,22 +81,38 @@ class OptionsGreeksCalculator:
 
     def _parse_exchange_expiry(self, expiry_str: str) -> datetime:
         """
-        Parse the expiry string. If the year is unreasonably high (e.g. >2100),
-        log a warning and adjust the year to the expected value.
+        Parse the expiry string using several formats.
+        If the expiry string is numeric (all digits, length 8), try parsing as ddmmyyyy and mmddyyyy.
+        Also includes a sanity check.
         """
         try:
             clean_str = re.sub(r'[^a-zA-Z0-9]', '', expiry_str).upper()
+            
+            if clean_str.isdigit() and len(clean_str) == 8:
+                try:
+                    parsed = datetime.strptime(clean_str, "%d%m%Y")
+                    return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+                except Exception as e:
+                    logger.warning(f"Numeric expiry parsing (ddmmyyyy) failed for {clean_str}: {e}")
+                try:
+                    parsed = datetime.strptime(clean_str, "%m%d%Y")
+                    return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
+                except Exception as e:
+                    logger.warning(f"Numeric expiry parsing (mmddyyyy) failed for {clean_str}: {e}")
+            
             for fmt in ['%d%b%Y', '%Y%m%d']:
                 try:
                     parsed = datetime.strptime(clean_str, fmt)
-                    # Sanity check: If the parsed year is higher than 2100, adjust it.
                     if parsed.year > 2100:
                         logger.warning(f"Parsed year {parsed.year} is too high; adjusting to 2025.")
                         parsed = parsed.replace(year=2025)
                     return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
                 except ValueError:
                     continue
-            raise ValueError(f"Unsupported expiry format: {expiry_str}")
+            logger.error(f"Unsupported expiry format: {expiry_str}")
+            default_expiry = datetime.now().astimezone() + timedelta(days=30)
+            logger.warning(f"Falling back to default expiry: {default_expiry.strftime('%d-%b-%Y')}")
+            return default_expiry
         except Exception as e:
             logger.error(f"Expiry parsing error for {expiry_str}: {e}")
             raise
@@ -140,7 +156,6 @@ class IndexOptionsAnalyzer:
 
             logger.info(f"Processing options with current price: {current_price}, VIX: {vix}")
 
-            # Reorganize options from options_structure (preferred) or from current_market if necessary.
             reorganized_options = self.reorganize_options_data(current_market, current_price)
             processed_calls = [self._process_contract(opt, current_price, vix, futures_data) 
                                for opt in reorganized_options.get("calls", [])]
@@ -259,59 +274,63 @@ class IndexOptionsAnalyzer:
 
     def _parse_trading_symbol(self, symbol: str) -> Dict[str, Any]:
         """
-        Parse the trading symbol to extract strike, expiry, and option type.
-        If the symbol starts with "SENSEX", expect a different format where the month is given as two digits.
-        For example, for SENSEX, the structure might be:
-           SENSEX2521177900CE  => Root: SENSEX, Day: 25, Month (digits): 21, Year: 17 (or 2017), Strike: 7900, Option: CE.
-        In that case, we convert the numeric month into a three-letter abbreviation.
+        Parse the trading symbol.
+        
+        If the symbol starts with "SENSEX", try first the specialized SENSEX parsing
+        (which expects expiry in yymdd format), but if that fails or the expiry seems
+        unreasonably formatted, fall back to the general pattern.
         """
+        # Attempt specialized parsing for SENSEX format
         if symbol.startswith("SENSEX"):
-            # Use a pattern that expects a two-digit month.
-            pattern = r'^(?P<root>SENSEX)(?P<day>\d{2})(?P<month>\d{2})(?P<year>\d{2,4})(?P<strike>\d+)(?P<opt_code>CE|PE)$'
-            m = re.match(pattern, symbol)
-            if not m:
-                raise ValueError(f"Unable to parse trading symbol: {symbol}")
-            day = m.group('day')
-            month_digits = m.group('month')
-            # Map two-digit month to three-letter abbreviation.
-            month_mapping = {
-                "01": "JAN", "02": "FEB", "03": "MAR", "04": "APR",
-                "05": "MAY", "06": "JUN", "07": "JUL", "08": "AUG",
-                "09": "SEP", "10": "OCT", "11": "NOV", "12": "DEC"
-            }
-            mon = month_mapping.get(month_digits, month_digits)
-            year = m.group('year')
-            if len(year) == 2:
-                year = "20" + year
-            expiry = f"{day}{mon}{year}"
-            strike = float(m.group('strike'))
-            opt_code = m.group('opt_code')
-            opt_type = 'CALL' if opt_code == 'CE' else 'PUT'
-            return {
-                'strikePrice': strike,
-                'expiry': expiry,
-                'optionType': opt_type
-            }
-        else:
-            # Use the original pattern.
-            pattern = r'^(?P<root>[A-Z]+)(?P<day>\d{2})(?P<mon>[A-Z]{3})(?P<year>\d{2,4})(?P<strike>\d+)(?P<opt_code>CE|PE)$'
-            m = re.match(pattern, symbol)
-            if not m:
-                raise ValueError(f"Unable to parse trading symbol: {symbol}")
-            day = m.group('day')
-            mon = m.group('mon')
-            year = m.group('year')
-            if len(year) == 2:
-                year = "20" + year
-            expiry = f"{day}{mon}{year}"
-            strike = float(m.group('strike'))
-            opt_code = m.group('opt_code')
-            opt_type = 'CALL' if opt_code == 'CE' else 'PUT'
-            return {
-                'strikePrice': strike,
-                'expiry': expiry,
-                'optionType': opt_type
-            }
+            sensex_pattern = r'^(?P<root>SENSEX)(?P<expiry>\d{5})(?P<strike>\d+)(?P<opt_code>CE|PE)$'
+            m = re.match(sensex_pattern, symbol)
+            if m:
+                expiry_digits = m.group('expiry')
+                # Interpret expiry as: first two digits: year, next digit: month, next two: day
+                try:
+                    yy = expiry_digits[0:2]
+                    m_digit = expiry_digits[2]
+                    dd = expiry_digits[3:5]
+                    year = int(yy) + 2000  # assuming two-digit year means 2000+
+                    month = int(m_digit)
+                    day = int(dd)
+                    expiry_date = datetime(year, month, day)
+                    expiry_str = expiry_date.strftime('%d%m%Y')
+                except Exception as e:
+                    logger.warning(f"Specialized SENSEX expiry parsing failed for {symbol}: {e}")
+                    expiry_str = None
+                # If we got a valid expiry_str, use it.
+                if expiry_str:
+                    strike = float(m.group('strike'))
+                    opt_type = 'CALL' if m.group('opt_code') == 'CE' else 'PUT'
+                    return {
+                        'strikePrice': strike,
+                        'expiry': expiry_str,
+                        'optionType': opt_type,
+                        'tradingSymbol': symbol
+                    }
+            # If specialized parsing fails, fall through to the general parsing below.
+            logger.info(f"Specialized parsing for SENSEX symbol {symbol} did not succeed; falling back to general parsing.")
+        
+        # General parsing for other symbols (or fallback for SENSEX)
+        general_pattern = r'^(?P<root>[A-Z]+)(?P<day>\d{2})(?P<mon>[A-Z]{3})(?P<year>\d{2,4})(?P<strike>\d+)(?P<opt_code>CE|PE)$'
+        m = re.match(general_pattern, symbol)
+        if not m:
+            raise ValueError(f"Unable to parse trading symbol: {symbol}")
+        day = m.group('day')
+        mon = m.group('mon')
+        year = m.group('year')
+        if len(year) == 2:
+            year = '20' + year
+        expiry = f"{day}{mon}{year}"
+        strike = float(m.group('strike'))
+        opt_type = 'CALL' if m.group('opt_code') == 'CE' else 'PUT'
+        return {
+            'strikePrice': strike,
+            'expiry': expiry,
+            'optionType': opt_type,
+            'tradingSymbol': symbol
+        }
 
     def _calculate_liquidity(self, option: Dict, futures: Dict) -> float:
         try:
