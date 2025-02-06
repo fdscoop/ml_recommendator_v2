@@ -80,11 +80,19 @@ class OptionsGreeksCalculator:
             return 0.0
 
     def _parse_exchange_expiry(self, expiry_str: str) -> datetime:
+        """
+        Parse the expiry string. If the year is unreasonably high (e.g. >2100),
+        log a warning and adjust the year to the expected value.
+        """
         try:
             clean_str = re.sub(r'[^a-zA-Z0-9]', '', expiry_str).upper()
             for fmt in ['%d%b%Y', '%Y%m%d']:
                 try:
                     parsed = datetime.strptime(clean_str, fmt)
+                    # Sanity check: If the parsed year is higher than 2100, adjust it.
+                    if parsed.year > 2100:
+                        logger.warning(f"Parsed year {parsed.year} is too high; adjusting to 2025.")
+                        parsed = parsed.replace(year=2025)
                     return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
                 except ValueError:
                     continue
@@ -217,22 +225,18 @@ class IndexOptionsAnalyzer:
         return flattened
 
     def _process_contract(self, contract: Dict, spot: float, iv: float, futures: Dict) -> Dict:
-        # We assume that if options_structure is present, expiry is available.
         required_fields = ['ltp', 'strikePrice', 'expiry', 'optionType']
         if not all(k in contract for k in required_fields):
-            # Fallback: parse details from tradingSymbol if available.
             trading_symbol = contract.get('tradingSymbol', '')
             if not trading_symbol:
                 raise ValueError("Missing tradingSymbol to parse contract details")
             parsed_data = self._parse_trading_symbol(trading_symbol)
             contract.update(parsed_data)
-        # Always use the expiry from the options_structure.
         expiry_str = contract.get('expiry')
         expiry_date = self.greeks_calculator._parse_exchange_expiry(expiry_str)
-        # Note: We do not divide the strike since it’s already normalized by your Retool JS.
         greeks = self.greeks_calculator.calculate_greeks(
             spot=spot,
-            strike=contract['strikePrice'],
+            strike=contract['strikePrice'],  # Strike is already normalized.
             expiry=expiry_date.strftime('%d%b%Y').upper(),
             iv=iv,
             opt_type='CE' if contract['optionType'].upper() == 'CALL' else 'PE'
