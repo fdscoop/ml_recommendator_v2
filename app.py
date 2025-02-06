@@ -258,23 +258,60 @@ class IndexOptionsAnalyzer:
         }
 
     def _parse_trading_symbol(self, symbol: str) -> Dict[str, Any]:
-        pattern = r'^(?P<root>[A-Z]+)(?P<day>\d{2})(?P<mon>[A-Z]{3})(?P<year>\d{2,4})(?P<strike>\d+)(?P<opt_code>CE|PE)$'
-        m = re.match(pattern, symbol)
-        if not m:
-            raise ValueError(f"Unable to parse trading symbol: {symbol}")
-        day = m.group('day')
-        mon = m.group('mon')
-        year = m.group('year')
-        if len(year) == 2:
-            year = '20' + year
-        expiry = f"{day}{mon}{year}"
-        strike = float(m.group('strike'))
-        opt_type = 'CALL' if m.group('opt_code') == 'CE' else 'PUT'
-        return {
-            'strikePrice': strike,
-            'expiry': expiry,
-            'optionType': opt_type
-        }
+        """
+        Parse the trading symbol to extract strike, expiry, and option type.
+        If the symbol starts with "SENSEX", expect a different format where the month is given as two digits.
+        For example, for SENSEX, the structure might be:
+           SENSEX2521177900CE  => Root: SENSEX, Day: 25, Month (digits): 21, Year: 17 (or 2017), Strike: 7900, Option: CE.
+        In that case, we convert the numeric month into a three-letter abbreviation.
+        """
+        if symbol.startswith("SENSEX"):
+            # Use a pattern that expects a two-digit month.
+            pattern = r'^(?P<root>SENSEX)(?P<day>\d{2})(?P<month>\d{2})(?P<year>\d{2,4})(?P<strike>\d+)(?P<opt_code>CE|PE)$'
+            m = re.match(pattern, symbol)
+            if not m:
+                raise ValueError(f"Unable to parse trading symbol: {symbol}")
+            day = m.group('day')
+            month_digits = m.group('month')
+            # Map two-digit month to three-letter abbreviation.
+            month_mapping = {
+                "01": "JAN", "02": "FEB", "03": "MAR", "04": "APR",
+                "05": "MAY", "06": "JUN", "07": "JUL", "08": "AUG",
+                "09": "SEP", "10": "OCT", "11": "NOV", "12": "DEC"
+            }
+            mon = month_mapping.get(month_digits, month_digits)
+            year = m.group('year')
+            if len(year) == 2:
+                year = "20" + year
+            expiry = f"{day}{mon}{year}"
+            strike = float(m.group('strike'))
+            opt_code = m.group('opt_code')
+            opt_type = 'CALL' if opt_code == 'CE' else 'PUT'
+            return {
+                'strikePrice': strike,
+                'expiry': expiry,
+                'optionType': opt_type
+            }
+        else:
+            # Use the original pattern.
+            pattern = r'^(?P<root>[A-Z]+)(?P<day>\d{2})(?P<mon>[A-Z]{3})(?P<year>\d{2,4})(?P<strike>\d+)(?P<opt_code>CE|PE)$'
+            m = re.match(pattern, symbol)
+            if not m:
+                raise ValueError(f"Unable to parse trading symbol: {symbol}")
+            day = m.group('day')
+            mon = m.group('mon')
+            year = m.group('year')
+            if len(year) == 2:
+                year = "20" + year
+            expiry = f"{day}{mon}{year}"
+            strike = float(m.group('strike'))
+            opt_code = m.group('opt_code')
+            opt_type = 'CALL' if opt_code == 'CE' else 'PUT'
+            return {
+                'strikePrice': strike,
+                'expiry': expiry,
+                'optionType': opt_type
+            }
 
     def _calculate_liquidity(self, option: Dict, futures: Dict) -> float:
         try:
