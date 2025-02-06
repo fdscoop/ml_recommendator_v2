@@ -29,31 +29,45 @@ app = Flask(__name__)
 CORS(app)
 
 ###############################################################################
-# PART 1: Options & Market Analysis Components (With Fixes)
+# PART 1: Options & Market Analysis Components
 ###############################################################################
 
 class OptionsGreeksCalculator:
+    """
+    Computes option Greeks (delta, gamma, theta, vega, etc.) 
+    given the underlying price, strike, expiry, implied volatility, and option type.
+    """
     def __init__(self, risk_free_rate: float = None):
         self.risk_free_rate = risk_free_rate or float(os.getenv('RISK_FREE_RATE', 0.07))
 
     def calculate_greeks(self, spot: float, strike: float, expiry: str, iv: float, opt_type: str) -> Dict[str, float]:
-        iv_decimal = iv / 100
-        t = self._time_to_expiry(expiry)
-
-        if t <= 0:
-            return self._expiry_greeks(spot, strike, opt_type)
-
-        sqrt_t = np.sqrt(t)
-        d1 = (np.log(spot / strike) + (self.risk_free_rate + 0.5 * iv_decimal ** 2) * t) / (iv_decimal * sqrt_t)
-        d2 = d1 - iv_decimal * sqrt_t
-
-        return {
-            'delta': norm.cdf(d1) if opt_type.upper() == 'CE' else -norm.cdf(-d1),
-            'gamma': norm.pdf(d1) / (spot * iv_decimal * sqrt_t),
-            'theta': (-spot * norm.pdf(d1) * iv_decimal) / (2 * sqrt_t) / 365,
-            'vega': spot * sqrt_t * norm.pdf(d1) / 100,
-            'iv_impact': iv_decimal / 20
-        }
+        try:
+            if spot <= 0 or strike <= 0 or iv <= 0:
+                return {}
+            t = self._time_to_expiry(expiry)
+            if t <= 0:
+                return self._expiry_greeks(spot, strike, opt_type)
+            sqrt_t = np.sqrt(t)
+            d1 = (np.log(spot / strike) + (self.risk_free_rate + 0.5 * iv ** 2) * t) / (iv * sqrt_t)
+            d2 = d1 - iv * sqrt_t
+            if opt_type.upper() == 'CE':
+                delta = norm.cdf(d1)
+                theta = (-(spot * norm.pdf(d1) * iv) / (2 * sqrt_t) -
+                         self.risk_free_rate * strike * np.exp(-self.risk_free_rate * t) * norm.cdf(d2))
+            else:
+                delta = -norm.cdf(-d1)
+                theta = (-(spot * norm.pdf(d1) * iv) / (2 * sqrt_t) +
+                         self.risk_free_rate * strike * np.exp(-self.risk_free_rate * t) * norm.cdf(-d2))
+            return {
+                'delta': delta,
+                'gamma': norm.pdf(d1) / (spot * iv * sqrt_t),
+                'theta': theta / 365,
+                'vega': spot * sqrt_t * norm.pdf(d1) / 100,
+                'iv_impact': iv / 20
+            }
+        except Exception as e:
+            logger.error(f"Greeks calculation error: {e}")
+            return {}
 
     def _time_to_expiry(self, expiry: str) -> float:
         try:
@@ -68,17 +82,13 @@ class OptionsGreeksCalculator:
     def _parse_exchange_expiry(self, expiry_str: str) -> datetime:
         try:
             clean_str = re.sub(r'[^a-zA-Z0-9]', '', expiry_str).upper()
-            # Handle formats like 27FEB2025
-            if len(clean_str) == 9 and clean_str[2:5].isalpha():
-                return datetime.strptime(clean_str, '%d%b%Y')
-            
-            # Existing formats
             for fmt in ['%d%b%Y', '%Y%m%d']:
                 try:
-                    return datetime.strptime(clean_str, fmt)
+                    parsed = datetime.strptime(clean_str, fmt)
+                    return parsed.replace(tzinfo=datetime.now().astimezone().tzinfo)
                 except ValueError:
                     continue
-            raise ValueError(f"Unsupported expiry format: {clean_str}")
+            raise ValueError(f"Unsupported expiry format: {expiry_str}")
         except Exception as e:
             logger.error(f"Expiry parsing error for {expiry_str}: {e}")
             raise
@@ -94,48 +104,49 @@ class OptionsGreeksCalculator:
         }
 
 class IndexOptionsAnalyzer:
+    """
+    Extracts historical index, VIX, futures, and options data from the payload.
+    Reorganizes the options data into exactly three calls and three puts.
+    Also computes technical indicators (pivot, support, and resistance) from today's data.
+    """
     def __init__(self):
         self.greeks_calculator = OptionsGreeksCalculator()
 
     def analyze_options(self, payload: Dict) -> Dict:
         try:
             analysis_data = payload.get('analysis', {})
-
-            # Try options_structure first.
-            options_data = analysis_data.get('options_structure', {}).get('options')
-            if not options_data or not options_data.get('byExpiry'):
-                logger.warning("⚠️ options_structure is empty or missing expected keys! Falling back to current_market['options']")
-                current_market = analysis_data.get('current_market', {})
-                options_data = current_market.get('options', {})
-
-            current_market = analysis_data.get('current_market', {})
+            required_keys = ['current_market', 'historical_data']
+            if not all(k in analysis_data for k in required_keys):
+                return {'error': f"Missing required keys: {required_keys}"}
+            current_market = analysis_data['current_market']
+            historical_data = analysis_data['historical_data']
+            market_required = ['index', 'vix', 'futures', 'options']
+            if not all(k in current_market for k in market_required):
+                return {'error': f"Current market missing keys: {market_required}"}
             index_data = current_market.get('index', {})
-            current_price = index_data.get('ltp', 0) or index_data.get('close', 0)
-            # Use the vix from current_market and convert to a percentage later.
+            current_price = index_data.get('ltp', 0)
+            if current_price == 0:
+                current_price = index_data.get('close', 0)
             vix = current_market.get('vix', {}).get('ltp', 0) / 100
             futures_data = current_market.get('futures', {})
 
-            logger.debug(f"Raw options_data: {json.dumps(options_data, indent=2)}")
-            reorganized_options = self.reorganize_options_data({'options': options_data}, current_price)
-            logger.debug(f"Reorganized options: {reorganized_options}")
-
             logger.info(f"Processing options with current price: {current_price}, VIX: {vix}")
 
-            processed_calls = [self._process_contract(opt, current_price, vix * 100, futures_data)
+            # Reorganize options from options_structure (preferred) or from current_market if necessary.
+            reorganized_options = self.reorganize_options_data(current_market, current_price)
+            processed_calls = [self._process_contract(opt, current_price, vix, futures_data) 
                                for opt in reorganized_options.get("calls", [])]
-            processed_puts = [self._process_contract(opt, current_price, vix * 100, futures_data)
+            processed_puts = [self._process_contract(opt, current_price, vix, futures_data) 
                               for opt in reorganized_options.get("puts", [])]
             options_chain = {"calls": processed_calls, "puts": processed_puts}
 
-            historical_data = analysis_data.get('historical_data', {})
             historical_index_prices = [
                 entry["price_data"]["close"]
                 for entry in historical_data.get("index", [])
                 if "price_data" in entry and "close" in entry["price_data"]
             ]
             technical_indicators = self._compute_technical_indicators(historical_data)
-            
-            return {
+            result = {
                 'current_price': current_price,
                 'vix': vix * 100,
                 'options_chain': options_chain,
@@ -144,6 +155,7 @@ class IndexOptionsAnalyzer:
                 'historical_index_prices': historical_index_prices,
                 'technical_indicators': technical_indicators
             }
+            return result
         except Exception as e:
             logger.error(f"Analysis error: {str(e)}", exc_info=True)
             return {'error': str(e)}
@@ -178,24 +190,12 @@ class IndexOptionsAnalyzer:
 
     def reorganize_options_data(self, current_market: Dict, spot: float) -> Dict[str, List[Dict]]:
         options_data = current_market.get('options', {})
-        # Check if options_data is in byExpiry format
-        if "byExpiry" in options_data:
-            flattened = self._flatten_options(options_data)
-        else:
-            # Assume flat structure with calls/puts keys
-            flattened = {"calls": options_data.get("calls", []), "puts": options_data.get("puts", [])}
-        
+        flattened = self._flatten_options(options_data)
         calls = flattened.get("calls", [])
         puts = flattened.get("puts", [])
-        
-        # Filter out invalid contracts missing critical fields
-        valid_calls = [c for c in calls if all(k in c for k in ('strikePrice', 'ltp', 'expiry'))]
-        valid_puts = [p for p in puts if all(k in p for k in ('strikePrice', 'ltp', 'expiry'))]
-        
-        calls_sorted = sorted(valid_calls, key=lambda opt: abs(opt['strikePrice'] - spot))[:3]
-        puts_sorted = sorted(valid_puts, key=lambda opt: abs(opt['strikePrice'] - spot))[:3]
-        
-        return {"calls": calls_sorted, "puts": puts_sorted}
+        calls_sorted = sorted(calls, key=lambda opt: abs(opt.get('strikePrice', float('inf')) - spot))
+        puts_sorted = sorted(puts, key=lambda opt: abs(opt.get('strikePrice', float('inf')) - spot))
+        return {"calls": calls_sorted[:3], "puts": puts_sorted[:3]}
 
     def _flatten_options(self, options_data: Dict) -> Dict[str, List[Dict]]:
         flattened = {"calls": [], "puts": []}
@@ -217,74 +217,69 @@ class IndexOptionsAnalyzer:
         return flattened
 
     def _process_contract(self, contract: Dict, spot: float, iv: float, futures: Dict) -> Dict:
-        try:
-            # Normalize strike price: convert 23500 to 235.00
-            strike = contract['strikePrice'] / 100
-
-            # Always use the expiry from the options_structure if available.
-            expiry_date = None
-            if contract.get('expiry'):
-                try:
-                    expiry_date = datetime.strptime(contract['expiry'], '%d%b%Y')
-                except Exception:
-                    expiry_date = None
-
-            # If expiry_date is not available, as a fallback try to parse from tradingSymbol.
-            if not expiry_date:
-                expiry_str = self._parse_expiry_from_symbol(contract.get('tradingSymbol', ''))
-                try:
-                    expiry_date = datetime.strptime(expiry_str, '%d%b%Y')
-                except Exception as e:
-                    logger.error(f"Failed to parse expiry from symbol {contract.get('tradingSymbol', '')}: {e}")
-                    expiry_date = datetime.now()  # or handle appropriately
-
-            # Calculate greeks with the expiry from options_structure.
-            greeks = self.greeks_calculator.calculate_greeks(
-                spot=spot,
-                strike=strike,
-                expiry=expiry_date.strftime('%d%b%Y').upper(),
-                iv=iv,
-                opt_type='CE' if contract.get('optionType', '').upper() == 'CALL' else 'PE'
-            )
-            
-            return {
-                'symbol': contract.get('tradingSymbol', ''),
-                'strike': contract['strikePrice'],
-                'premium': contract['ltp'],
-                'expiry': expiry_date.strftime('%d-%b-%Y').upper(),
-                'type': contract.get('optionType', '').upper(),
-                'greeks': greeks,
-                'liquidity_score': self._calculate_liquidity(contract, futures),
-                'depth': self._process_depth(contract.get('depth', {})),
-                'timeframe_suitability': {
-                    'scalping': greeks.get('gamma', 0) * 2,
-                    'intraday': greeks.get('delta', 0) ** 2,
-                    'swing': greeks.get('vega', 0) * 0.7
-                }
+        # We assume that if options_structure is present, expiry is available.
+        required_fields = ['ltp', 'strikePrice', 'expiry', 'optionType']
+        if not all(k in contract for k in required_fields):
+            # Fallback: parse details from tradingSymbol if available.
+            trading_symbol = contract.get('tradingSymbol', '')
+            if not trading_symbol:
+                raise ValueError("Missing tradingSymbol to parse contract details")
+            parsed_data = self._parse_trading_symbol(trading_symbol)
+            contract.update(parsed_data)
+        # Always use the expiry from the options_structure.
+        expiry_str = contract.get('expiry')
+        expiry_date = self.greeks_calculator._parse_exchange_expiry(expiry_str)
+        # Note: We do not divide the strike since it’s already normalized by your Retool JS.
+        greeks = self.greeks_calculator.calculate_greeks(
+            spot=spot,
+            strike=contract['strikePrice'],
+            expiry=expiry_date.strftime('%d%b%Y').upper(),
+            iv=iv,
+            opt_type='CE' if contract['optionType'].upper() == 'CALL' else 'PE'
+        )
+        return {
+            'symbol': contract.get('tradingSymbol', ''),
+            'strike': contract['strikePrice'],
+            'premium': contract['ltp'],
+            'expiry': expiry_date.strftime('%d-%b-%Y').upper(),
+            'type': contract['optionType'].upper(),
+            'greeks': greeks,
+            'liquidity_score': self._calculate_liquidity(contract, futures),
+            'depth': self._process_depth(contract.get('depth', {})),
+            'timeframe_suitability': {
+                'scalping': greeks.get('gamma', 0) * 2,
+                'intraday': greeks.get('delta', 0) ** 2,
+                'swing': greeks.get('vega', 0) * 0.7
             }
-        except Exception as e:
-            logger.error(f"Contract processing error: {str(e)}")
-            return {}
+        }
 
-    def _parse_expiry_from_symbol(self, symbol: str) -> str:
-        try:
-            match = re.search(r'\d{2}[A-Z]{3}\d{2,4}', symbol)
-            if match:
-                return match.group()
-            return symbol[-9:-2] if len(symbol) > 9 else "UNKNOWN_EXPIRY"
-        except Exception:
-            return "UNKNOWN_EXPIRY"
+    def _parse_trading_symbol(self, symbol: str) -> Dict[str, Any]:
+        pattern = r'^(?P<root>[A-Z]+)(?P<day>\d{2})(?P<mon>[A-Z]{3})(?P<year>\d{2,4})(?P<strike>\d+)(?P<opt_code>CE|PE)$'
+        m = re.match(pattern, symbol)
+        if not m:
+            raise ValueError(f"Unable to parse trading symbol: {symbol}")
+        day = m.group('day')
+        mon = m.group('mon')
+        year = m.group('year')
+        if len(year) == 2:
+            year = '20' + year
+        expiry = f"{day}{mon}{year}"
+        strike = float(m.group('strike'))
+        opt_type = 'CALL' if m.group('opt_code') == 'CE' else 'PUT'
+        return {
+            'strikePrice': strike,
+            'expiry': expiry,
+            'optionType': opt_type
+        }
 
     def _calculate_liquidity(self, option: Dict, futures: Dict) -> float:
         try:
             option_oi = option.get('opnInterest', 0)
-            futures_oi = futures.get('openInterest', 1)
+            futures_oi = futures.get('opnInterest', 1)
             option_vol = option.get('tradeVolume', 0)
             futures_vol = futures.get('tradeVolume', 1)
-
             oi_ratio = option_oi / futures_oi if futures_oi > 0 else 0
             vol_ratio = option_vol / futures_vol if futures_vol > 0 else 0
-
             return min(0.4 * oi_ratio + 0.6 * vol_ratio, 1.0)
         except Exception:
             return 0.5
@@ -344,7 +339,7 @@ class IndexOptionsAnalyzer:
             return {'scalping': 0.34, 'intraday': 0.33, 'swing': 0.33}
 
 ###############################################################################
-# PART 2: Forecasting Engine (Full Original Implementation)
+# PART 2: Forecasting Engine (ARIMA and LSTM with Scaling)
 ###############################################################################
 
 class ForecastingEngine:
@@ -399,7 +394,7 @@ class ForecastingEngine:
         }
 
 ###############################################################################
-# PART 3: Trading Strategy Engine (Full Original Implementation)
+# PART 3: Trading Strategy Engine
 ###############################################################################
 
 class TradingStrategyEngine:
@@ -499,7 +494,7 @@ class TradingStrategyEngine:
         }
 
 ###############################################################################
-# PART 4: Flask Endpoints (With Enhanced Logging)
+# PART 4: Flask Endpoints
 ###############################################################################
 
 @app.route('/webhook', methods=['POST'])
@@ -507,44 +502,21 @@ def handle_webhook():
     try:
         payload = request.get_json()
         logger.info(f"Received webhook payload: {json.dumps(payload, indent=2)}")
-
-        # Enhanced options validation
-        options_structure = payload.get('analysis', {}).get('options_structure', {}).get('options')
-        current_market_options = payload.get('analysis', {}).get('current_market', {}).get('options')
-        
-        if options_structure:
-            # If byExpiry exists, count the contracts under calls and puts.
-            calls_count = 0
-            puts_count = 0
-            if options_structure.get('byExpiry'):
-                for expiry_data in options_structure['byExpiry'].values():
-                    calls_count += len(expiry_data.get('calls', {}))
-                    puts_count += len(expiry_data.get('puts', {}))
-            else:
-                calls_count = len(options_structure.get('calls', []))
-                puts_count = len(options_structure.get('puts', []))
-            logger.info("✅ Found options_structure with %d calls and %d puts", calls_count, puts_count)
-        else:
-            logger.warning("⚠️ No options_structure found in payload")
-            
-        if current_market_options:
-            calls_count = len(current_market_options.get('calls', []))
-            puts_count = len(current_market_options.get('puts', []))
-            logger.info("ℹ️ Found current_market options with %d calls and %d puts", calls_count, puts_count)
-
+        if not payload or 'success' not in payload or 'analysis' not in payload:
+            return jsonify({
+                "success": False,
+                "error": "Invalid payload format - missing required root keys"
+            }), 400
         analysis_data = payload['analysis']
         analyzer = IndexOptionsAnalyzer()
         analysis_result = analyzer.analyze_options({'analysis': analysis_data})
-        
         if 'error' in analysis_result:
             return jsonify({
                 "success": False,
                 "error": analysis_result['error']
             }), 400
-
         strategy_engine = TradingStrategyEngine()
         strategies = strategy_engine.generate_strategies(analysis_result)
-        
         return jsonify({
             "success": True,
             "analysis": analysis_result,
@@ -563,7 +535,7 @@ def home():
     return "Hello, Flask is running!"
 
 ###############################################################################
-# PART 5: Main (Original Implementation)
+# PART 5: Main (Heroku Deployment)
 ###############################################################################
 
 if __name__ == '__main__':
